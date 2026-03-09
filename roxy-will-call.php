@@ -1,12 +1,15 @@
 <?php
 /**
  * Plugin Name: Roxy Will Call (WooCommerce)
- * Description: Generates will call lists for WooCommerce products with check-in tracking, order links, dates, totals, and revenue.
- * Version: 0.2.0
+ * Description: Will call list for WooCommerce products with check-in tracking, order links, dates, totals, revenue, attendance counters, and search.
+ * Version: 0.3.1
  */
 
 if (!defined('ABSPATH')) exit;
 
+/**
+ * Admin menu
+ */
 add_action('admin_menu', function () {
   if (!class_exists('WooCommerce')) return;
 
@@ -20,8 +23,12 @@ add_action('admin_menu', function () {
   );
 });
 
+/**
+ * Activation: create check-in table
+ */
 register_activation_hook(__FILE__, function () {
   global $wpdb;
+
   $table = $wpdb->prefix . 'roxy_will_call_checkins';
   $charset_collate = $wpdb->get_charset_collate();
 
@@ -40,13 +47,20 @@ register_activation_hook(__FILE__, function () {
   dbDelta($sql);
 });
 
+/**
+ * Admin page
+ */
 function roxy_will_call_admin_page() {
   if (!current_user_can('manage_woocommerce')) {
     wp_die('Not allowed.');
   }
 
-  $selected_product_id = isset($_GET['product_id']) ? absint($_GET['product_id']) : 0;
+  if (!function_exists('wc_get_products')) {
+    echo '<div class="notice notice-error"><p>WooCommerce functions not available. Is WooCommerce active?</p></div>';
+    return;
+  }
 
+  $selected_product_id = isset($_GET['product_id']) ? absint($_GET['product_id']) : 0;
   ?>
   <div class="wrap">
     <h1>Will Call</h1>
@@ -64,9 +78,7 @@ function roxy_will_call_admin_page() {
     <?php
       if ($selected_product_id) {
         $result = roxy_will_call_get_list($selected_product_id);
-        $rows = $result['rows'];
-        $totals = $result['totals'];
-        roxy_will_call_render_table($selected_product_id, $rows, $totals);
+        roxy_will_call_render_table($selected_product_id, $result['rows'], $result['totals']);
       } else {
         echo '<p>Select a product to generate the list.</p>';
       }
@@ -74,9 +86,8 @@ function roxy_will_call_admin_page() {
   </div>
 
   <style>
-    /* Print-friendly */
     @media print {
-      #adminmenumain, #wpadminbar, .notice, .update-nag, .wrap form, .wrap .button { display:none !important; }
+      #adminmenumain, #wpadminbar, .notice, .update-nag, .wrap form, .wrap .button, .roxy-wc-search-wrap { display:none !important; }
       .wrap { margin: 0; }
       table { font-size: 12px; }
       input[type="number"] { width: 60px; }
@@ -98,17 +109,31 @@ function roxy_will_call_admin_page() {
       align-items: center;
       flex-wrap: wrap;
     }
-    .roxy-wc-summary .metric {
-      min-width: 180px;
+    .roxy-wc-summary .metric { min-width: 160px; }
+    .roxy-wc-summary .label { font-size: 12px; color: #666; margin-bottom: 2px; }
+    .roxy-wc-summary .value { font-size: 18px; font-weight: 700; }
+
+    .roxy-wc-search-wrap {
+      margin: 12px 0;
+      background: #fff;
+      border: 1px solid #dcdcde;
+      border-radius: 8px;
+      padding: 12px 14px;
     }
-    .roxy-wc-summary .label {
+    .roxy-wc-search-wrap label {
+      display: block;
       font-size: 12px;
       color: #666;
-      margin-bottom: 2px;
+      margin-bottom: 6px;
     }
-    .roxy-wc-summary .value {
-      font-size: 18px;
-      font-weight: 700;
+    .roxy-wc-search {
+      width: 100%;
+      max-width: 420px;
+      padding: 8px 10px;
+    }
+
+    .roxy-wc-hidden {
+      display: none !important;
     }
   </style>
 
@@ -117,6 +142,51 @@ function roxy_will_call_admin_page() {
       const table = document.querySelector('.roxy-wc-table');
       if (!table) return;
 
+      const searchInput = document.querySelector('.roxy-wc-search');
+      const checkedInEl = document.getElementById('roxy-wc-checked-in');
+      const remainingEl = document.getElementById('roxy-wc-remaining');
+      const soldEl = document.getElementById('roxy-wc-total-sold');
+
+      function recalcAttendance() {
+        let sold = 0;
+        let checkedIn = 0;
+
+        const rows = table.querySelectorAll('tbody tr[data-customer-key]');
+        rows.forEach((tr) => {
+          const qty = parseInt(tr.getAttribute('data-qty') || '0', 10);
+          const usedInput = tr.querySelector('input.roxy-used');
+          const usedQty = parseInt((usedInput && usedInput.value) || '0', 10);
+
+          sold += qty;
+          checkedIn += usedQty;
+        });
+
+        const remaining = Math.max(0, sold - checkedIn);
+
+        if (soldEl) soldEl.textContent = sold.toLocaleString();
+        if (checkedInEl) checkedInEl.textContent = checkedIn.toLocaleString();
+        if (remainingEl) remainingEl.textContent = remaining.toLocaleString();
+      }
+
+      function applySearch() {
+        if (!searchInput) return;
+        const q = searchInput.value.trim().toLowerCase();
+        const rows = table.querySelectorAll('tbody tr[data-customer-key]');
+
+        rows.forEach((tr) => {
+          const haystack = (tr.getAttribute('data-search') || '').toLowerCase();
+          if (!q || haystack.includes(q)) {
+            tr.classList.remove('roxy-wc-hidden');
+          } else {
+            tr.classList.add('roxy-wc-hidden');
+          }
+        });
+      }
+
+      if (searchInput) {
+        searchInput.addEventListener('input', applySearch);
+      }
+
       table.addEventListener('change', async (e) => {
         const tr = e.target.closest('tr[data-customer-key]');
         if (!tr) return;
@@ -124,7 +194,13 @@ function roxy_will_call_admin_page() {
         const productId = table.getAttribute('data-product-id');
         const customerKey = tr.getAttribute('data-customer-key');
         const checked = tr.querySelector('input.roxy-checked').checked ? 1 : 0;
-        const usedQty = parseInt(tr.querySelector('input.roxy-used').value || '0', 10);
+        const usedInput = tr.querySelector('input.roxy-used');
+        const maxQty = parseInt(usedInput.getAttribute('max') || '0', 10);
+        let usedQty = parseInt(usedInput.value || '0', 10);
+
+        if (isNaN(usedQty) || usedQty < 0) usedQty = 0;
+        if (usedQty > maxQty) usedQty = maxQty;
+        usedInput.value = usedQty;
 
         const form = new FormData();
         form.append('action', 'roxy_will_call_save');
@@ -141,6 +217,7 @@ function roxy_will_call_admin_page() {
             const badge = tr.querySelector('.roxy-wc-saved');
             badge.style.display = 'inline';
             setTimeout(()=> badge.style.display = 'none', 900);
+            recalcAttendance();
           } else {
             alert('Save failed.');
           }
@@ -148,11 +225,17 @@ function roxy_will_call_admin_page() {
           alert('Save error.');
         }
       });
+
+      recalcAttendance();
+      applySearch();
     });
   </script>
   <?php
 }
 
+/**
+ * Product dropdown
+ */
 function roxy_will_call_product_dropdown($selected) {
   $products = wc_get_products([
     'limit' => 200,
@@ -169,7 +252,7 @@ function roxy_will_call_product_dropdown($selected) {
     $id = $p->get_id();
     $name = $p->get_name();
     $sel = selected($selected, $id, false);
-    $html .= "<option value=\"" . esc_attr($id) . "\" $sel>" . esc_html("{$name} (#{$id})") . "</option>";
+    $html .= '<option value="' . esc_attr($id) . '" ' . $sel . '>' . esc_html($name . ' (#' . $id . ')') . '</option>';
   }
 
   $html .= '</select>';
@@ -177,19 +260,20 @@ function roxy_will_call_product_dropdown($selected) {
 }
 
 /**
- * Returns:
- * [
- *   'rows' => aggregated rows,
- *   'totals' => ['total_qty' => int, 'total_revenue' => float, 'order_count' => int]
- * ]
+ * Build will call list + totals
  *
- * Revenue uses (line_total + line_total_tax) for matching items.
+ * REFUND HANDLING:
+ * - Refund objects are ignored entirely.
+ * - Only "shop_order" types are queried.
+ *
+ * Revenue uses (line_total + line_total_tax) for matching line items.
  */
 function roxy_will_call_get_list($product_id) {
-  $statuses = ['wc-processing', 'wc-completed']; // adjust if desired
+  $product_id = (int)$product_id;
+  $statuses = ['wc-processing', 'wc-completed'];
 
-  // Pull a reasonable window; adjust as needed
   $order_ids = wc_get_orders([
+    'type' => 'shop_order',
     'status' => $statuses,
     'limit' => -1,
     'return' => 'ids',
@@ -205,23 +289,25 @@ function roxy_will_call_get_list($product_id) {
     $order = wc_get_order($oid);
     if (!$order) continue;
 
+    if (class_exists('WC_Order_Refund') && ($order instanceof WC_Order_Refund)) continue;
+    if (!($order instanceof WC_Order)) continue;
+
     $matched_this_order = false;
 
     foreach ($order->get_items('line_item') as $item) {
-      $pid = (int) $item->get_product_id();
-      $vid = (int) $item->get_variation_id();
-      $matches = ($pid === (int)$product_id || $vid === (int)$product_id);
+      $pid = (int)$item->get_product_id();
+      $vid = (int)$item->get_variation_id();
+      $matches = ($pid === $product_id || $vid === $product_id);
 
       if (!$matches) continue;
 
       $matched_this_order = true;
 
-      $qty = (int) $item->get_quantity();
+      $qty = (int)$item->get_quantity();
       $total_qty += $qty;
 
-      // Revenue: line total + tax for that line item
-      $line_total = (float) $item->get_total();
-      $line_tax   = (float) $item->get_total_tax();
+      $line_total = (float)$item->get_total();
+      $line_tax   = (float)$item->get_total_tax();
       $total_revenue += ($line_total + $line_tax);
 
       $first = trim((string)$order->get_billing_first_name());
@@ -232,7 +318,6 @@ function roxy_will_call_get_list($product_id) {
       if ($name === '') $name = 'Unknown Name';
       if ($email === '') $email = 'unknown-email';
 
-      // Customer key used for check-in persistence
       $customer_key = md5($name . '|' . $email);
 
       if (!isset($agg[$customer_key])) {
@@ -241,8 +326,8 @@ function roxy_will_call_get_list($product_id) {
           'name' => $name,
           'email' => $email,
           'qty' => 0,
-          'orders' => [],         // [order_id => 'Y-m-d H:i:s']
-          'latest_order_ts' => 0, // unix ts
+          'orders' => [],
+          'latest_order_ts' => 0,
         ];
       }
 
@@ -251,23 +336,18 @@ function roxy_will_call_get_list($product_id) {
       $date_created = $order->get_date_created();
       $ts = $date_created ? $date_created->getTimestamp() : 0;
 
-      if ($date_created) {
-        $agg[$customer_key]['orders'][$oid] = $date_created->date('Y-m-d H:i:s');
-      } else {
-        $agg[$customer_key]['orders'][$oid] = '';
-      }
+      $agg[$customer_key]['orders'][(int)$oid] = $date_created ? $date_created->date('Y-m-d H:i:s') : '';
 
-      if ($ts > $agg[$customer_key]['latest_order_ts']) {
+      if ($ts > (int)$agg[$customer_key]['latest_order_ts']) {
         $agg[$customer_key]['latest_order_ts'] = $ts;
       }
     }
 
     if ($matched_this_order) {
-      $matching_order_ids[$oid] = true;
+      $matching_order_ids[(int)$oid] = true;
     }
   }
 
-  // Convert to indexed array + sort A→Z
   $rows = array_values($agg);
   usort($rows, function($a, $b) {
     return strcasecmp($a['name'], $b['name']);
@@ -283,30 +363,48 @@ function roxy_will_call_get_list($product_id) {
   ];
 }
 
+/**
+ * Render table
+ */
 function roxy_will_call_render_table($product_id, $rows, $totals) {
   $nonce = wp_create_nonce('roxy_will_call_save');
-
-  // Load existing check-ins
   $checkins = roxy_will_call_get_checkins_map($product_id);
 
   $product = wc_get_product($product_id);
-  $title = $product ? $product->get_name() : "Product #$product_id";
+  $title = $product ? $product->get_name() : 'Product #' . (int)$product_id;
 
-  echo '<h2 style="margin-top:18px;">' . esc_html($title) . '</h2>';
-  echo '<p class="roxy-wc-muted">Orders counted: Processing + Completed. Names are aggregated by Billing Name + Email.</p>';
-
-  // Summary metrics
   $total_qty = isset($totals['total_qty']) ? (int)$totals['total_qty'] : 0;
   $total_revenue = isset($totals['total_revenue']) ? (float)$totals['total_revenue'] : 0.0;
   $order_count = isset($totals['order_count']) ? (int)$totals['order_count'] : 0;
 
+  $checked_in_total = 0;
+  foreach ($rows as $r) {
+    $key = $r['customer_key'];
+    $saved = isset($checkins[$key]) ? $checkins[$key] : ['checked_in' => 0, 'used_qty' => 0];
+    $used_qty = isset($saved['used_qty']) ? (int)$saved['used_qty'] : 0;
+    if ($used_qty < 0) $used_qty = 0;
+    if ($used_qty > (int)$r['qty']) $used_qty = (int)$r['qty'];
+    $checked_in_total += $used_qty;
+  }
+  $remaining_total = max(0, $total_qty - $checked_in_total);
+
+  echo '<h2 style="margin-top:18px;">' . esc_html($title) . '</h2>';
+  echo '<p class="roxy-wc-muted">Orders counted: Processing + Completed. Refunds are ignored.</p>';
+
   echo '<div class="roxy-wc-summary">';
-  echo '  <div class="metric"><div class="label">Total items sold</div><div class="value">' . esc_html(number_format_i18n($total_qty)) . '</div></div>';
+  echo '  <div class="metric"><div class="label">Total items sold</div><div class="value" id="roxy-wc-total-sold">' . esc_html(number_format_i18n($total_qty)) . '</div></div>';
+  echo '  <div class="metric"><div class="label">Checked In</div><div class="value" id="roxy-wc-checked-in">' . esc_html(number_format_i18n($checked_in_total)) . '</div></div>';
+  echo '  <div class="metric"><div class="label">Remaining</div><div class="value" id="roxy-wc-remaining">' . esc_html(number_format_i18n($remaining_total)) . '</div></div>';
   echo '  <div class="metric"><div class="label">Total revenue</div><div class="value">' . wp_kses_post(wc_price($total_revenue)) . '</div></div>';
   echo '  <div class="metric"><div class="label">Matching orders</div><div class="value">' . esc_html(number_format_i18n($order_count)) . '</div></div>';
   echo '</div>';
 
-  echo '<table class="widefat striped roxy-wc-table" data-product-id="' . esc_attr($product_id) . '" data-nonce="' . esc_attr($nonce) . '">';
+  echo '<div class="roxy-wc-search-wrap">';
+  echo '  <label for="roxy-wc-search">Search will call list</label>';
+  echo '  <input type="text" id="roxy-wc-search" class="roxy-wc-search" placeholder="Search name, email, or order #..." />';
+  echo '</div>';
+
+  echo '<table class="widefat striped roxy-wc-table" data-product-id="' . esc_attr((int)$product_id) . '" data-nonce="' . esc_attr($nonce) . '">';
   echo '<thead><tr>';
   echo '<th style="width:40px;">#</th>';
   echo '<th>Name</th>';
@@ -325,16 +423,16 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
     $key = $r['customer_key'];
     $qty = (int)$r['qty'];
 
-    $saved = $checkins[$key] ?? ['checked_in' => 0, 'used_qty' => 0];
-    $checked = (int)$saved['checked_in'] === 1;
+    $saved = isset($checkins[$key]) ? $checkins[$key] : ['checked_in' => 0, 'used_qty' => 0];
+    $checked = ((int)$saved['checked_in'] === 1);
     $used_qty = (int)$saved['used_qty'];
 
-    // clamp used qty to sensible range
     if ($used_qty < 0) $used_qty = 0;
     if ($used_qty > $qty) $used_qty = $qty;
 
-    // Build order links
     $order_links = [];
+    $order_ids_for_search = [];
+
     if (!empty($r['orders']) && is_array($r['orders'])) {
       $order_ids = array_keys($r['orders']);
       sort($order_ids, SORT_NUMERIC);
@@ -342,17 +440,25 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
       foreach ($order_ids as $oid) {
         $url = admin_url('post.php?post=' . absint($oid) . '&action=edit');
         $order_links[] = '<a href="' . esc_url($url) . '" target="_blank">#' . esc_html($oid) . '</a>';
+        $order_ids_for_search[] = '#' . absint($oid);
+        $order_ids_for_search[] = (string) absint($oid);
       }
     }
+
     $orders_html = $order_links ? implode(', ', $order_links) : '—';
 
-    // Latest order date for this aggregated row
     $latest_date = '—';
     if (!empty($r['latest_order_ts'])) {
       $latest_date = wp_date('Y-m-d g:ia', (int)$r['latest_order_ts']);
     }
 
-    echo '<tr data-customer-key="' . esc_attr($key) . '">';
+    $search_text = trim(
+      $r['name'] . ' ' .
+      $r['email'] . ' ' .
+      implode(' ', $order_ids_for_search)
+    );
+
+    echo '<tr data-customer-key="' . esc_attr($key) . '" data-qty="' . esc_attr($qty) . '" data-search="' . esc_attr(strtolower($search_text)) . '">';
     echo '<td>' . esc_html($i) . '</td>';
     echo '<td><strong>' . esc_html($r['name']) . '</strong></td>';
     echo '<td>' . esc_html($r['email']) . '</td>';
@@ -372,12 +478,15 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
   echo '</tbody></table>';
 }
 
+/**
+ * Checkins map
+ */
 function roxy_will_call_get_checkins_map($product_id) {
   global $wpdb;
   $table = $wpdb->prefix . 'roxy_will_call_checkins';
 
   $rows = $wpdb->get_results(
-    $wpdb->prepare("SELECT customer_key, checked_in, used_qty FROM $table WHERE product_id = %d", $product_id),
+    $wpdb->prepare("SELECT customer_key, checked_in, used_qty FROM $table WHERE product_id = %d", (int)$product_id),
     ARRAY_A
   );
 
@@ -391,6 +500,9 @@ function roxy_will_call_get_checkins_map($product_id) {
   return $map;
 }
 
+/**
+ * AJAX save
+ */
 add_action('wp_ajax_roxy_will_call_save', function () {
   if (!current_user_can('manage_woocommerce')) {
     wp_send_json_error(['message' => 'Not allowed']);
@@ -417,17 +529,17 @@ add_action('wp_ajax_roxy_will_call_save', function () {
   $table = $wpdb->prefix . 'roxy_will_call_checkins';
   $now = current_time('mysql');
 
-  // Upsert
   $existing = $wpdb->get_var($wpdb->prepare(
     "SELECT id FROM $table WHERE product_id=%d AND customer_key=%s",
-    $product_id, $customer_key
+    $product_id,
+    $customer_key
   ));
 
   if ($existing) {
     $wpdb->update(
       $table,
       ['checked_in' => $checked_in, 'used_qty' => $used_qty, 'updated_at' => $now],
-      ['id' => $existing],
+      ['id' => (int)$existing],
       ['%d','%d','%s'],
       ['%d']
     );
