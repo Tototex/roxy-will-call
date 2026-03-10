@@ -1,11 +1,52 @@
 <?php
 /**
  * Plugin Name: Roxy Will Call (WooCommerce)
- * Description: Will call list for WooCommerce products with check-in tracking, order links, dates, totals, revenue, attendance counters, and search.
- * Version: 0.3.1
+ * Description: Will call list for WooCommerce products or Roxy Showings with check-in tracking, order links, dates, totals, revenue, attendance counters, and search.
+ * Version: 0.3.2
  */
 
 if (!defined('ABSPATH')) exit;
+
+const ROXY_WC_CONTEXT_SHOWING_OFFSET = 1000000000;
+
+function roxy_will_call_context_numeric_id(string $mode, int $id): int {
+  return $mode === 'showing' ? (ROXY_WC_CONTEXT_SHOWING_OFFSET + $id) : $id;
+}
+
+function roxy_will_call_parse_id_list($raw): array {
+  if (is_array($raw)) {
+    $raw = implode("\n", array_map('intval', $raw));
+  }
+  $parts = preg_split('/[\r\n,]+/', (string) $raw);
+  $ids = [];
+  foreach ((array)$parts as $part) {
+    $id = absint(trim((string)$part));
+    if ($id > 0) $ids[$id] = $id;
+  }
+  return array_values($ids);
+}
+
+function roxy_will_call_showing_product_ids(int $showing_id): array {
+  $ids = [];
+  foreach (['adult','discount','matinee','live1','live2','subscriber'] as $type) {
+    $pid = (int) get_post_meta($showing_id, '_roxy_pid_' . $type, true);
+    if ($pid > 0) $ids[$pid] = $pid;
+  }
+  $legacy = roxy_will_call_parse_id_list(get_post_meta($showing_id, '_roxy_legacy_product_ids', true));
+  foreach ($legacy as $pid) $ids[$pid] = $pid;
+  return array_values($ids);
+}
+
+function roxy_will_call_showing_label(int $showing_id): string {
+  $title = get_the_title($showing_id) ?: ('Showing #' . $showing_id);
+  $start = get_post_meta($showing_id, '_roxy_start', true);
+  $date = '';
+  if ($start) {
+    $ts = strtotime((string)$start);
+    if ($ts) $date = ' — ' . wp_date('M j, Y g:ia', $ts);
+  }
+  return $title . $date . ' (#' . $showing_id . ')';
+}
 
 /**
  * Admin menu
@@ -60,27 +101,47 @@ function roxy_will_call_admin_page() {
     return;
   }
 
+  $mode = isset($_GET['mode']) && $_GET['mode'] === 'product' ? 'product' : 'showing';
   $selected_product_id = isset($_GET['product_id']) ? absint($_GET['product_id']) : 0;
+  $selected_showing_id = isset($_GET['showing_id']) ? absint($_GET['showing_id']) : 0;
   ?>
   <div class="wrap">
     <h1>Will Call</h1>
 
-    <form method="get" style="margin: 12px 0;">
+    <form method="get" style="margin: 12px 0; display:flex; gap:10px; align-items:end; flex-wrap:wrap;">
       <input type="hidden" name="page" value="roxy-will-call" />
-      <label for="product_id"><strong>Select ticket product:</strong></label>
-      <?php echo roxy_will_call_product_dropdown($selected_product_id); ?>
-      <button class="button button-primary">Load</button>
-      <?php if ($selected_product_id): ?>
-        <button type="button" class="button" onclick="window.print()">Print</button>
-      <?php endif; ?>
+      <div>
+        <label for="mode"><strong>Mode</strong></label><br />
+        <select name="mode" id="mode">
+          <option value="showing" <?php selected($mode, 'showing'); ?>>Showing</option>
+          <option value="product" <?php selected($mode, 'product'); ?>>Product</option>
+        </select>
+      </div>
+      <div class="roxy-wc-mode roxy-wc-mode-showing" <?php if ($mode !== 'showing') echo 'style="display:none"'; ?>>
+        <label for="showing_id"><strong>Select showing:</strong></label><br />
+        <?php echo roxy_will_call_showing_dropdown($selected_showing_id); ?>
+      </div>
+      <div class="roxy-wc-mode roxy-wc-mode-product" <?php if ($mode !== 'product') echo 'style="display:none"'; ?>>
+        <label for="product_id"><strong>Select ticket product:</strong></label><br />
+        <?php echo roxy_will_call_product_dropdown($selected_product_id); ?>
+      </div>
+      <div>
+        <button class="button button-primary">Load</button>
+        <?php if (($mode === 'product' && $selected_product_id) || ($mode === 'showing' && $selected_showing_id)): ?>
+          <button type="button" class="button" onclick="window.print()">Print</button>
+        <?php endif; ?>
+      </div>
     </form>
 
     <?php
-      if ($selected_product_id) {
-        $result = roxy_will_call_get_list($selected_product_id);
-        roxy_will_call_render_table($selected_product_id, $result['rows'], $result['totals']);
+      if ($mode === 'showing' && $selected_showing_id) {
+        $result = roxy_will_call_get_showing_list($selected_showing_id);
+        roxy_will_call_render_table('showing', $selected_showing_id, $result['rows'], $result['totals']);
+      } elseif ($mode === 'product' && $selected_product_id) {
+        $result = roxy_will_call_get_list([$selected_product_id]);
+        roxy_will_call_render_table('product', $selected_product_id, $result['rows'], $result['totals']);
       } else {
-        echo '<p>Select a product to generate the list.</p>';
+        echo '<p>Select a showing or product to generate the list.</p>';
       }
     ?>
   </div>
@@ -140,6 +201,14 @@ function roxy_will_call_admin_page() {
   <script>
     document.addEventListener('DOMContentLoaded', () => {
       const table = document.querySelector('.roxy-wc-table');
+      const modeSelect = document.getElementById('mode');
+      if (modeSelect) {
+        modeSelect.addEventListener('change', () => {
+          document.querySelectorAll('.roxy-wc-mode').forEach(el => el.style.display = 'none');
+          const target = document.querySelector('.roxy-wc-mode-' + modeSelect.value);
+          if (target) target.style.display = '';
+        });
+      }
       if (!table) return;
 
       const searchInput = document.querySelector('.roxy-wc-search');
@@ -191,7 +260,7 @@ function roxy_will_call_admin_page() {
         const tr = e.target.closest('tr[data-customer-key]');
         if (!tr) return;
 
-        const productId = table.getAttribute('data-product-id');
+        const contextId = table.getAttribute('data-context-id');
         const customerKey = tr.getAttribute('data-customer-key');
         const checked = tr.querySelector('input.roxy-checked').checked ? 1 : 0;
         const usedInput = tr.querySelector('input.roxy-used');
@@ -205,7 +274,7 @@ function roxy_will_call_admin_page() {
         const form = new FormData();
         form.append('action', 'roxy_will_call_save');
         form.append('nonce', table.getAttribute('data-nonce'));
-        form.append('product_id', productId);
+        form.append('context_id', contextId);
         form.append('customer_key', customerKey);
         form.append('checked_in', checked);
         form.append('used_qty', usedQty);
@@ -260,16 +329,50 @@ function roxy_will_call_product_dropdown($selected) {
 }
 
 /**
- * Build will call list + totals
- *
- * REFUND HANDLING:
- * - Refund objects are ignored entirely.
- * - Only "shop_order" types are queried.
- *
- * Revenue uses (line_total + line_total_tax) for matching line items.
+ * Showing dropdown
  */
-function roxy_will_call_get_list($product_id) {
-  $product_id = (int)$product_id;
+function roxy_will_call_showing_dropdown($selected) {
+  $posts = get_posts([
+    'post_type' => 'roxy_showing',
+    'post_status' => ['publish','private','draft','future'],
+    'numberposts' => 200,
+    'orderby' => 'meta_value',
+    'meta_key' => '_roxy_start',
+    'order' => 'ASC',
+    'meta_query' => [[
+      'key' => '_roxy_start',
+      'compare' => 'EXISTS',
+    ]],
+  ]);
+
+  $html = '<select name="showing_id" id="showing_id" style="min-width:420px;">';
+  $html .= '<option value="0">— Select Showing —</option>';
+  foreach ($posts as $p) {
+    $id = $p->ID;
+    $sel = selected($selected, $id, false);
+    $html .= '<option value="' . esc_attr($id) . '" ' . $sel . '>' . esc_html(roxy_will_call_showing_label($id)) . '</option>';
+  }
+  $html .= '</select>';
+  return $html;
+}
+
+/**
+ * Build will call list + totals
+ */
+function roxy_will_call_get_showing_list($showing_id) {
+  $product_ids = roxy_will_call_showing_product_ids((int)$showing_id);
+  return roxy_will_call_get_list($product_ids);
+}
+
+function roxy_will_call_get_list($product_ids) {
+  $product_ids = array_values(array_filter(array_map('intval', (array)$product_ids)));
+  if (!$product_ids) {
+    return [
+      'rows' => [],
+      'totals' => ['total_qty' => 0, 'total_revenue' => 0.0, 'order_count' => 0],
+    ];
+  }
+
   $statuses = ['wc-processing', 'wc-completed'];
 
   $order_ids = wc_get_orders([
@@ -280,6 +383,7 @@ function roxy_will_call_get_list($product_id) {
     'date_created' => '>' . (new DateTime('-18 months'))->format('Y-m-d'),
   ]);
 
+  $product_lookup = array_fill_keys($product_ids, true);
   $agg = [];
   $total_qty = 0;
   $total_revenue = 0.0;
@@ -288,7 +392,6 @@ function roxy_will_call_get_list($product_id) {
   foreach ($order_ids as $oid) {
     $order = wc_get_order($oid);
     if (!$order) continue;
-
     if (class_exists('WC_Order_Refund') && ($order instanceof WC_Order_Refund)) continue;
     if (!($order instanceof WC_Order)) continue;
 
@@ -297,12 +400,10 @@ function roxy_will_call_get_list($product_id) {
     foreach ($order->get_items('line_item') as $item) {
       $pid = (int)$item->get_product_id();
       $vid = (int)$item->get_variation_id();
-      $matches = ($pid === $product_id || $vid === $product_id);
-
+      $matches = isset($product_lookup[$pid]) || isset($product_lookup[$vid]);
       if (!$matches) continue;
 
       $matched_this_order = true;
-
       $qty = (int)$item->get_quantity();
       $total_qty += $qty;
 
@@ -313,11 +414,9 @@ function roxy_will_call_get_list($product_id) {
       $first = trim((string)$order->get_billing_first_name());
       $last  = trim((string)$order->get_billing_last_name());
       $email = strtolower(trim((string)$order->get_billing_email()));
-
       $name = trim($first . ' ' . $last);
       if ($name === '') $name = 'Unknown Name';
       if ($email === '') $email = 'unknown-email';
-
       $customer_key = md5($name . '|' . $email);
 
       if (!isset($agg[$customer_key])) {
@@ -332,12 +431,9 @@ function roxy_will_call_get_list($product_id) {
       }
 
       $agg[$customer_key]['qty'] += $qty;
-
       $date_created = $order->get_date_created();
       $ts = $date_created ? $date_created->getTimestamp() : 0;
-
       $agg[$customer_key]['orders'][(int)$oid] = $date_created ? $date_created->date('Y-m-d H:i:s') : '';
-
       if ($ts > (int)$agg[$customer_key]['latest_order_ts']) {
         $agg[$customer_key]['latest_order_ts'] = $ts;
       }
@@ -349,9 +445,7 @@ function roxy_will_call_get_list($product_id) {
   }
 
   $rows = array_values($agg);
-  usort($rows, function($a, $b) {
-    return strcasecmp($a['name'], $b['name']);
-  });
+  usort($rows, function($a, $b) { return strcasecmp($a['name'], $b['name']); });
 
   return [
     'rows' => $rows,
@@ -366,12 +460,17 @@ function roxy_will_call_get_list($product_id) {
 /**
  * Render table
  */
-function roxy_will_call_render_table($product_id, $rows, $totals) {
+function roxy_will_call_render_table($mode, $id, $rows, $totals) {
   $nonce = wp_create_nonce('roxy_will_call_save');
-  $checkins = roxy_will_call_get_checkins_map($product_id);
+  $context_id = roxy_will_call_context_numeric_id($mode, (int)$id);
+  $checkins = roxy_will_call_get_checkins_map($context_id);
 
-  $product = wc_get_product($product_id);
-  $title = $product ? $product->get_name() : 'Product #' . (int)$product_id;
+  if ($mode === 'showing') {
+    $title = roxy_will_call_showing_label((int)$id);
+  } else {
+    $product = wc_get_product((int)$id);
+    $title = $product ? $product->get_name() : 'Product #' . (int)$id;
+  }
 
   $total_qty = isset($totals['total_qty']) ? (int)$totals['total_qty'] : 0;
   $total_revenue = isset($totals['total_revenue']) ? (float)$totals['total_revenue'] : 0.0;
@@ -389,7 +488,11 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
   $remaining_total = max(0, $total_qty - $checked_in_total);
 
   echo '<h2 style="margin-top:18px;">' . esc_html($title) . '</h2>';
-  echo '<p class="roxy-wc-muted">Orders counted: Processing + Completed. Refunds are ignored.</p>';
+  if ($mode === 'showing') {
+    echo '<p class="roxy-wc-muted">Showing mode combines new Roxy ticket products and any mapped Legacy Product IDs. Orders counted: Processing + Completed.</p>';
+  } else {
+    echo '<p class="roxy-wc-muted">Orders counted: Processing + Completed. Refunds are ignored.</p>';
+  }
 
   echo '<div class="roxy-wc-summary">';
   echo '  <div class="metric"><div class="label">Total items sold</div><div class="value" id="roxy-wc-total-sold">' . esc_html(number_format_i18n($total_qty)) . '</div></div>';
@@ -404,7 +507,7 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
   echo '  <input type="text" id="roxy-wc-search" class="roxy-wc-search" placeholder="Search name, email, or order #..." />';
   echo '</div>';
 
-  echo '<table class="widefat striped roxy-wc-table" data-product-id="' . esc_attr((int)$product_id) . '" data-nonce="' . esc_attr($nonce) . '">';
+  echo '<table class="widefat striped roxy-wc-table" data-context-id="' . esc_attr((int)$context_id) . '" data-nonce="' . esc_attr($nonce) . '">';
   echo '<thead><tr>';
   echo '<th style="width:40px;">#</th>';
   echo '<th>Name</th>';
@@ -422,21 +525,17 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
     $i++;
     $key = $r['customer_key'];
     $qty = (int)$r['qty'];
-
     $saved = isset($checkins[$key]) ? $checkins[$key] : ['checked_in' => 0, 'used_qty' => 0];
     $checked = ((int)$saved['checked_in'] === 1);
     $used_qty = (int)$saved['used_qty'];
-
     if ($used_qty < 0) $used_qty = 0;
     if ($used_qty > $qty) $used_qty = $qty;
 
     $order_links = [];
     $order_ids_for_search = [];
-
     if (!empty($r['orders']) && is_array($r['orders'])) {
       $order_ids = array_keys($r['orders']);
       sort($order_ids, SORT_NUMERIC);
-
       foreach ($order_ids as $oid) {
         $url = admin_url('post.php?post=' . absint($oid) . '&action=edit');
         $order_links[] = '<a href="' . esc_url($url) . '" target="_blank">#' . esc_html($oid) . '</a>';
@@ -444,19 +543,12 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
         $order_ids_for_search[] = (string) absint($oid);
       }
     }
-
     $orders_html = $order_links ? implode(', ', $order_links) : '—';
-
     $latest_date = '—';
     if (!empty($r['latest_order_ts'])) {
       $latest_date = wp_date('Y-m-d g:ia', (int)$r['latest_order_ts']);
     }
-
-    $search_text = trim(
-      $r['name'] . ' ' .
-      $r['email'] . ' ' .
-      implode(' ', $order_ids_for_search)
-    );
+    $search_text = trim($r['name'] . ' ' . $r['email'] . ' ' . implode(' ', $order_ids_for_search));
 
     echo '<tr data-customer-key="' . esc_attr($key) . '" data-qty="' . esc_attr($qty) . '" data-search="' . esc_attr(strtolower($search_text)) . '">';
     echo '<td>' . esc_html($i) . '</td>';
@@ -472,7 +564,7 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
   }
 
   if ($i === 0) {
-    echo '<tr><td colspan="9">No matching purchases found for this product.</td></tr>';
+    echo '<tr><td colspan="9">No matching purchases found for this selection.</td></tr>';
   }
 
   echo '</tbody></table>';
@@ -481,15 +573,13 @@ function roxy_will_call_render_table($product_id, $rows, $totals) {
 /**
  * Checkins map
  */
-function roxy_will_call_get_checkins_map($product_id) {
+function roxy_will_call_get_checkins_map($context_id) {
   global $wpdb;
   $table = $wpdb->prefix . 'roxy_will_call_checkins';
-
   $rows = $wpdb->get_results(
-    $wpdb->prepare("SELECT customer_key, checked_in, used_qty FROM $table WHERE product_id = %d", (int)$product_id),
+    $wpdb->prepare("SELECT customer_key, checked_in, used_qty FROM $table WHERE product_id = %d", (int)$context_id),
     ARRAY_A
   );
-
   $map = [];
   foreach ($rows as $r) {
     $map[$r['customer_key']] = [
@@ -513,13 +603,13 @@ add_action('wp_ajax_roxy_will_call_save', function () {
     wp_send_json_error(['message' => 'Bad nonce']);
   }
 
-  $product_id = isset($_POST['product_id']) ? absint($_POST['product_id']) : 0;
+  $context_id = isset($_POST['context_id']) ? absint($_POST['context_id']) : 0;
   $customer_key = isset($_POST['customer_key']) ? sanitize_text_field($_POST['customer_key']) : '';
   $checked_in = isset($_POST['checked_in']) ? absint($_POST['checked_in']) : 0;
   $used_qty = isset($_POST['used_qty']) ? intval($_POST['used_qty']) : 0;
 
-  if (!$product_id || !$customer_key) {
-    wp_send_json_error(['message' => 'Missing fields']);
+  if (!$context_id || !$customer_key) {
+    wp_send_json_error(['message' => 'Missing data']);
   }
 
   if ($used_qty < 0) $used_qty = 0;
@@ -527,35 +617,14 @@ add_action('wp_ajax_roxy_will_call_save', function () {
 
   global $wpdb;
   $table = $wpdb->prefix . 'roxy_will_call_checkins';
-  $now = current_time('mysql');
 
-  $existing = $wpdb->get_var($wpdb->prepare(
-    "SELECT id FROM $table WHERE product_id=%d AND customer_key=%s",
-    $product_id,
-    $customer_key
-  ));
+  $wpdb->replace($table, [
+    'product_id' => $context_id,
+    'customer_key' => $customer_key,
+    'checked_in' => $checked_in,
+    'used_qty' => $used_qty,
+    'updated_at' => current_time('mysql'),
+  ], ['%d', '%s', '%d', '%d', '%s']);
 
-  if ($existing) {
-    $wpdb->update(
-      $table,
-      ['checked_in' => $checked_in, 'used_qty' => $used_qty, 'updated_at' => $now],
-      ['id' => (int)$existing],
-      ['%d','%d','%s'],
-      ['%d']
-    );
-  } else {
-    $wpdb->insert(
-      $table,
-      [
-        'product_id' => $product_id,
-        'customer_key' => $customer_key,
-        'checked_in' => $checked_in,
-        'used_qty' => $used_qty,
-        'updated_at' => $now
-      ],
-      ['%d','%s','%d','%d','%s']
-    );
-  }
-
-  wp_send_json_success(['ok' => true]);
+  wp_send_json_success(['saved' => true]);
 });
