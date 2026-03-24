@@ -1,0 +1,54 @@
+name: Build Plugin ZIP
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-zip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Version
+        run: |
+          VERSION=$(grep -i "Version:" roxy-will-call.php | head -1 | sed 's/.*Version:[[:space:]]*//')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "PLUGIN=roxy-will-call" >> $GITHUB_ENV
+
+      - name: Build folder
+        run: |
+          rm -rf build
+          mkdir -p build/$PLUGIN
+          rsync -av ./ build/$PLUGIN \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'build/' \
+            --exclude '*.zip'
+
+      - name: Create ZIP
+        run: |
+          cd build
+          zip -r ${PLUGIN}-${VERSION}.zip $PLUGIN
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN }}-${{ env.VERSION }}
+          path: build/${{ env.PLUGIN }}-${{ env.VERSION }}.zip
+
+      - name: Attach ZIP to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/${{ env.PLUGIN }}-${{ env.VERSION }}.zip
+          generate_release_notes: true
