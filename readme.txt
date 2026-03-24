@@ -22,6 +22,6 @@ Manual check‑in system supporting:
 
 == Changelog ==
 
-= 0.3.4 =
+= 0.3.5 =
 * Add GitHub auto updates
 * Add release workflow
