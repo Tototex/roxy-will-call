@@ -2,14 +2,14 @@
 /**
  * Plugin Name: Roxy Will Call (WooCommerce)
  * Description: Will call list for WooCommerce products or Roxy Showings with check-in tracking, order links, dates, totals, revenue, attendance counters, and search.
- * Version: 0.3.6
+ * Version: 0.3.7
  * Author: Newport Roxy (AI Team)
  * Update URI: https://github.com/Tototex/roxy-will-call
  */
 
 if (!defined('ABSPATH')) exit;
 
-define('ROXY_WC_VERSION', '0.3.6');
+define('ROXY_WC_VERSION', '0.3.7');
 
 require_once __DIR__ . '/includes/class-roxy-wc-updater.php';
 
