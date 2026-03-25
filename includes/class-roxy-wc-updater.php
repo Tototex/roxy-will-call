@@ -29,6 +29,11 @@ class Updater {
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'filter_update_plugins']);
         add_filter('plugins_api', [__CLASS__, 'filter_plugins_api'], 20, 3);
         add_filter('upgrader_post_install', [__CLASS__, 'filter_upgrader_post_install'], 20, 3);
+        add_action('upgrader_process_complete', [__CLASS__, 'handle_upgrader_process_complete'], 20, 2);
+    }
+
+    private static function get_cache_key(): string {
+        return 'roxy_updater_' . md5(self::$config['github_repo'] . '|' . self::$config['slug']);
     }
 
     public static function filter_update_plugins($transient) {
@@ -106,12 +111,42 @@ class Updater {
         return $response;
     }
 
+    public static function handle_upgrader_process_complete($upgrader, $hook_extra): void {
+        if (empty(self::$config['plugin_file'])) {
+            return;
+        }
+
+        $action = isset($hook_extra['action']) ? (string) $hook_extra['action'] : '';
+        $type = isset($hook_extra['type']) ? (string) $hook_extra['type'] : '';
+        $plugins = isset($hook_extra['plugins']) && is_array($hook_extra['plugins']) ? $hook_extra['plugins'] : [];
+
+        if ($action !== 'update' || $type !== 'plugin') {
+            return;
+        }
+
+        if (!in_array(self::$config['plugin_file'], $plugins, true)) {
+            return;
+        }
+
+        self::clear_update_cache();
+    }
+
+    private static function clear_update_cache(): void {
+        self::$release = null;
+        delete_site_transient(self::get_cache_key());
+        delete_site_transient('update_plugins');
+
+        if (function_exists('wp_clean_plugins_cache')) {
+            wp_clean_plugins_cache(true);
+        }
+    }
+
     private static function get_latest_release(): ?array {
         if (self::$release !== null) {
             return self::$release;
         }
 
-        $cache_key = 'roxy_updater_' . md5(self::$config['github_repo'] . '|' . self::$config['slug']);
+        $cache_key = self::get_cache_key();
         $cached = get_site_transient($cache_key);
         if (is_array($cached) && !empty($cached['version']) && !empty($cached['download_url'])) {
             self::$release = $cached;
