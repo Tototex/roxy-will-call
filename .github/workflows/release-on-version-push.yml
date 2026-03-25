@@ -1,0 +1,174 @@
+name: Release plugin on version push
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roxy-will-call-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read plugin version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="roxy-will-call.php"
+          if [[ ! -f "$FILE" ]]; then
+            echo "Plugin base file not found: $FILE"
+            exit 1
+          fi
+
+          HEADER_VERSION="$(grep -m1 -E '^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*' "$FILE" | sed -E 's/^[[:space:]]*\*[[:space:]]*Version:[[:space:]]*//')"
+          CONST_VERSION="$(grep -m1 -E "define\('ROXY_WC_VERSION',[[:space:]]*'[^']+'\);" "$FILE" | sed -E "s/.*define\('ROXY_WC_VERSION',[[:space:]]*'([^']+)'\);.*/\1/")"
+
+          HEADER_VERSION="$(echo "$HEADER_VERSION" | tr -d '\r' | xargs)"
+          CONST_VERSION="$(echo "$CONST_VERSION" | tr -d '\r' | xargs)"
+
+          if [[ -z "$HEADER_VERSION" || -z "$CONST_VERSION" ]]; then
+            echo "Could not read version from plugin file."
+            exit 1
+          fi
+
+          if [[ "$HEADER_VERSION" != "$CONST_VERSION" ]]; then
+            echo "Plugin header version ($HEADER_VERSION) does not match internal version ($CONST_VERSION)."
+            exit 1
+          fi
+
+          echo "version=$HEADER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$HEADER_VERSION" >> "$GITHUB_OUTPUT"
+          echo "zip_name=roxy-will-call-$HEADER_VERSION.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Check latest release tag
+        id: latest
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const response = await github.rest.repos.getLatestRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              core.setOutput('tag', response.data.tag_name || '');
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput('tag', '');
+                return;
+              }
+              throw error;
+            }
+
+      - name: Decide whether to release
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NEW_TAG="${{ steps.version.outputs.tag }}"
+          LATEST_TAG="${{ steps.latest.outputs.tag }}"
+
+          if [[ -z "$LATEST_TAG" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEW_VERSION="${NEW_TAG#v}"
+          LATEST_VERSION="${LATEST_TAG#v}"
+
+          if [[ "$NEW_VERSION" == "$LATEST_VERSION" ]]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HIGHEST="$(printf '%s\n%s\n' "$LATEST_VERSION" "$NEW_VERSION" | sort -V | tail -n1)"
+          if [[ "$HIGHEST" == "$NEW_VERSION" ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Exit when no new version is present
+        if: steps.compare.outputs.should_release != 'true'
+        shell: bash
+        run: |
+          echo "No release created. Push detected, but plugin version was not higher than the latest GitHub release."
+
+      - name: Build plugin zip
+        if: steps.compare.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STAGE_DIR="build/roxy-will-call"
+          ZIP_PATH="build/${{ steps.version.outputs.zip_name }}"
+
+          rm -rf build
+          mkdir -p "$STAGE_DIR"
+
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='build' \
+            --exclude='.DS_Store' \
+            ./ "$STAGE_DIR"/
+
+          (
+            cd build
+            zip -r "${{ steps.version.outputs.zip_name }}" roxy-will-call >/dev/null
+          )
+
+          if [[ ! -f "$ZIP_PATH" ]]; then
+            echo "Zip was not created."
+            exit 1
+          fi
+
+      - name: Create Git tag
+        if: steps.compare.outputs.should_release == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = "${{ steps.version.outputs.tag }}";
+            const sha = context.sha;
+
+            try {
+              await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tag}`
+              });
+              core.info(`Tag ${tag} already exists. Skipping tag creation.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tag}`,
+                sha
+              });
+            }
+
+      - name: Create GitHub release
+        if: steps.compare.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Roxy Will Call ${{ steps.version.outputs.version }}
+          files: build/${{ steps.version.outputs.zip_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
